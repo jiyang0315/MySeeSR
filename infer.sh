@@ -8,4 +8,8 @@ CUDA_VISIBLE_DEVICES=1 python test_seesr.py \
 --start_point lr \
 --num_inference_steps 50 \
 --guidance_scale 5.5 \
---process_size 512 
+--process_size 512 \
+--spatial_noise_alpha 0.6 \
+--spatial_noise_edge_type sobel \
+--spatial_noise_edge_blur 0 \
+--spatial_noise_debug_every 200 

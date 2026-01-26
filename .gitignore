@@ -1,2 +1,5 @@
 experience/
 preset/
+__pycache__/
+*.py[cod]
+*.pyc.*

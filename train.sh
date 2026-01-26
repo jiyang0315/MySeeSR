@@ -10,4 +10,8 @@ CUDA_VISIBLE_DEVICES="2,3" accelerate launch --num_processes=2 --main_process_po
 --gradient_accumulation_steps=8 \
 --null_text_ratio=0.5 \
 --dataloader_num_workers=0 \
---checkpointing_steps=10000 
+--checkpointing_steps=10000 \
+--spatial_noise_alpha 0.6 \
+--spatial_noise_edge_type sobel \
+--spatial_noise_edge_blur 0 \
+--spatial_noise_debug_every 200

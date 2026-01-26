@@ -26,6 +26,7 @@ from huggingface_hub import create_repo, upload_folder
 from packaging import version
 from PIL import Image
 from torchvision import transforms
+from torchvision.utils import save_image
 from tqdm.auto import tqdm
 from transformers import AutoTokenizer, PretrainedConfig
 
@@ -43,6 +44,7 @@ from diffusers.utils import check_min_version, is_wandb_available
 from diffusers.utils.import_utils import is_xformers_available
 
 from dataloaders.paired_dataset import PairedCaptionDataset
+from utils.spatial_noise import compute_edge_strength
 
 from typing import Mapping, Any
 from torchvision import transforms
@@ -556,7 +558,32 @@ def parse_args(input_args=None):
     parser.add_argument("--ram_ft_path", type=str, default=None)
     parser.add_argument('--trainable_modules', nargs='*', type=str, default=["image_attentions"])
 
-    
+    # Spatial Asymmetry Noise Injection (training-time only)
+    parser.add_argument(
+        "--spatial_noise_alpha",
+        type=float,
+        default=0.0,
+        help="Edge-aware spatial noise scaling factor. 0 disables (original behavior). Suggested ~0.6.",
+    )
+    parser.add_argument(
+        "--spatial_noise_edge_type",
+        type=str,
+        default="sobel",
+        choices=["sobel", "laplacian"],
+        help="Edge operator used to build edge_strength.",
+    )
+    parser.add_argument(
+        "--spatial_noise_edge_blur",
+        type=int,
+        default=0,
+        help="Optional blur kernel size for edge_strength (0 disables). If even, it will be rounded up to the next odd value.",
+    )
+    parser.add_argument(
+        "--spatial_noise_debug_every",
+        type=int,
+        default=0,
+        help="Save edge_map/sigma_map debug images every N global steps to <output_dir>/debug (0 disables).",
+    )
     
 
     if input_args is not None:
@@ -971,12 +998,14 @@ for epoch in range(first_epoch, args.num_train_epochs):
         # with accelerator.accumulate(controlnet):
         with accelerator.accumulate(controlnet), accelerator.accumulate(unet):
             pixel_values = batch["pixel_values"].to(accelerator.device, dtype=weight_dtype)
+            controlnet_image = batch["conditioning_pixel_values"].to(accelerator.device, dtype=weight_dtype)
             # Convert images to latent space
             latents = vae.encode(pixel_values).latent_dist.sample()
             latents = latents * vae.config.scaling_factor
 
             # Sample noise that we'll add to the latents
             noise = torch.randn_like(latents)
+            noise_for_latents = noise
             bsz = latents.shape[0]
             # Sample a random timestep for each image
             timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (bsz,), device=latents.device)
@@ -984,12 +1013,57 @@ for epoch in range(first_epoch, args.num_train_epochs):
 
             # Add noise to the latents according to the noise magnitude at each timestep
             # (this is the forward diffusion process)
-            noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
+            #
+            # Spatial Asymmetry Noise Injection:
+            # - compute edge_strength from LR (controlnet_image), normalize to [0,1]
+            # - scale noise per-pixel: noise_for_latents = (1 - alpha * edge_strength) * noise
+            # Default alpha=0 keeps the original behavior exactly.
+            if args.spatial_noise_alpha and args.spatial_noise_alpha > 0:
+                with torch.no_grad():
+                    edge_strength = compute_edge_strength(
+                        controlnet_image.float(),
+                        edge_type=args.spatial_noise_edge_type,
+                        edge_blur=args.spatial_noise_edge_blur,
+                    )
+                    # Align edge map to latent resolution (B, 1, H_lat, W_lat)
+                    edge_strength = F.interpolate(
+                        edge_strength, size=latents.shape[-2:], mode="bilinear", align_corners=False
+                    )
+                    edge_strength = edge_strength.to(dtype=latents.dtype)
+
+                    noise_scale_map = (1.0 - args.spatial_noise_alpha * edge_strength).clamp(min=0.0)
+
+                noise_for_latents = noise * noise_scale_map
+
+                if (
+                    args.spatial_noise_debug_every
+                    and args.spatial_noise_debug_every > 0
+                    and accelerator.sync_gradients
+                    and accelerator.is_main_process
+                    and ((global_step + 1) % args.spatial_noise_debug_every == 0)
+                ):
+                    with torch.no_grad():
+                        # sigma(t) = sqrt(1 - alpha_cumprod[t]); sigma_map = sigma(t) * noise_scale_map
+                        alphas_cumprod = noise_scheduler.alphas_cumprod.to(device=latents.device, dtype=latents.dtype)
+                        sigma = (1.0 - alphas_cumprod[timesteps]).sqrt().view(bsz, 1, 1, 1)
+                        sigma_map = sigma * noise_scale_map
+
+                        debug_dir = os.path.join(args.output_dir, "debug")
+                        os.makedirs(debug_dir, exist_ok=True)
+
+                        edge_vis = edge_strength[:1].detach().float().clamp(0.0, 1.0)
+                        sigma_vis = sigma_map[:1].detach().float()
+                        sigma_vis = sigma_vis / (sigma_vis.amax(dim=(2, 3), keepdim=True) + 1e-12)
+                        sigma_vis = sigma_vis.clamp(0.0, 1.0)
+
+                        step_tag = global_step + 1
+                        save_image(edge_vis, os.path.join(debug_dir, f"edge_{step_tag:07d}.png"))
+                        save_image(sigma_vis, os.path.join(debug_dir, f"sigma_{step_tag:07d}.png"))
+
+            noisy_latents = noise_scheduler.add_noise(latents, noise_for_latents, timesteps)
 
             # # Get the text embedding for conditioning
             encoder_hidden_states = text_encoder(batch["input_ids"].to(accelerator.device))[0]
-
-            controlnet_image = batch["conditioning_pixel_values"].to(accelerator.device, dtype=weight_dtype)
 
             # extract soft semantic label
             with torch.no_grad():
@@ -1019,9 +1093,9 @@ for epoch in range(first_epoch, args.num_train_epochs):
 
             # Get the target for loss depending on the prediction type
             if noise_scheduler.config.prediction_type == "epsilon":
-                target = noise
+                target = noise_for_latents
             elif noise_scheduler.config.prediction_type == "v_prediction":
-                target = noise_scheduler.get_velocity(latents, noise, timesteps)
+                target = noise_scheduler.get_velocity(latents, noise_for_latents, timesteps)
             else:
                 raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
             loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")

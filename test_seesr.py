@@ -264,6 +264,11 @@ if __name__ == "__main__":
     parser.add_argument("--start_steps", type=int, default=999) # defaults set to 999.
     parser.add_argument("--start_point", type=str, choices=['lr', 'noise'], default='lr') # LR Embedding Strategy, choose 'lr latent + 999 steps noise' as diffusion start point. 
     parser.add_argument("--save_prompts", action='store_true')
+    # Spatial Asymmetry Noise Injection parameters (for compatibility with training)
+    parser.add_argument("--spatial_noise_alpha", type=float, default=0.0, help="Edge-aware spatial noise scaling factor. 0 disables (original behavior).")
+    parser.add_argument("--spatial_noise_edge_type", type=str, default="sobel", choices=["sobel", "laplacian"], help="Edge operator used to build edge_strength.")
+    parser.add_argument("--spatial_noise_edge_blur", type=int, default=0, help="Optional blur kernel size for edge_strength (0 disables).")
+    parser.add_argument("--spatial_noise_debug_every", type=int, default=0, help="Save edge_map/sigma_map debug images every N steps (0 disables).")
     args = parser.parse_args()
     main(args)
 

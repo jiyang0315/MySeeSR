@@ -1,12 +1,12 @@
-CUDA_VISIBLE_DEVICES="4,5" accelerate launch --num_processes=2 --main_process_port 12346 train_seesr.py \
+CUDA_VISIBLE_DEVICES="6,7" accelerate launch --num_processes=2 --main_process_port 12346 train_seesr.py \
 --pretrained_model_name_or_path="preset/models/stable-diffusion-2-base" \
---output_dir="./experience/seesr_noise" \
---root_folders 'preset/datasets/train_datasets/training_for_dape' \
+--output_dir="./experience/seesr_codeformer" \
+--root_folders 'preset/datasets/train_datasets/training_for_codeformer' \
 --mixed_precision="fp16" \
 --resolution=512 \
 --learning_rate=5e-5 \
 --train_batch_size=2 \
---gradient_accumulation_steps=8 \
+--gradient_accumulation_steps=16 \
 --null_text_ratio=0.5 \
 --dataloader_num_workers=0 \
 --checkpointing_steps=10000 \

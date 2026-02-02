@@ -1,7 +1,7 @@
-CUDA_VISIBLE_DEVICES="6,7" accelerate launch --num_processes=2 --main_process_port 12346 train_seesr.py \
+CUDA_VISIBLE_DEVICES="4,5" accelerate launch --num_processes=2 --main_process_port 12345 train_seesr.py \
 --pretrained_model_name_or_path="preset/models/stable-diffusion-2-base" \
---output_dir="./experience/seesr_codeformer" \
---root_folders 'preset/datasets/train_datasets/training_for_codeformer' \
+--output_dir="./experience/seesr_multi_scale" \
+--root_folders 'preset/datasets/train_datasets/training_for_dape' \
 --mixed_precision="fp16" \
 --resolution=512 \
 --learning_rate=5e-5 \
@@ -13,4 +13,10 @@ CUDA_VISIBLE_DEVICES="6,7" accelerate launch --num_processes=2 --main_process_po
 --spatial_noise_alpha 0.6 \
 --spatial_noise_edge_type sobel \
 --spatial_noise_edge_blur 0 \
---spatial_noise_debug_every 200
+--spatial_noise_debug_every 200 \
+--use_multi_scale_conditioning \
+--multi_scale_learnable \
+--multi_scale_progressive \
+--multi_scale_init_value 1.0 \
+--multi_scale_edge_scales "1.0,0.5,0.25" \
+--log_scale_weights_every 100

@@ -44,7 +44,8 @@ from diffusers.utils import check_min_version, is_wandb_available
 from diffusers.utils.import_utils import is_xformers_available
 
 from dataloaders.paired_dataset import PairedCaptionDataset
-from utils.spatial_noise import compute_edge_strength
+from utils.spatial_noise import compute_edge_strength, compute_multi_scale_edges
+from models.multi_scale_conditioning import create_multi_scale_injector
 
 from typing import Mapping, Any
 from torchvision import transforms
@@ -585,6 +586,40 @@ def parse_args(input_args=None):
         help="Save edge_map/sigma_map debug images every N global steps to <output_dir>/debug (0 disables).",
     )
     
+    # Multi-Scale Conditional Injection (Innovation)
+    parser.add_argument(
+        "--use_multi_scale_conditioning",
+        action="store_true",
+        help="Enable multi-scale conditional injection with learnable layer-wise scales.",
+    )
+    parser.add_argument(
+        "--multi_scale_learnable",
+        action="store_true",
+        help="Make the multi-scale conditioning weights learnable during training.",
+    )
+    parser.add_argument(
+        "--multi_scale_progressive",
+        action="store_true",
+        help="Use progressive scaling (stronger in shallow layers, weaker in deep layers).",
+    )
+    parser.add_argument(
+        "--multi_scale_init_value",
+        type=float,
+        default=1.0,
+        help="Initial value for multi-scale conditioning weights.",
+    )
+    parser.add_argument(
+        "--multi_scale_edge_scales",
+        type=str,
+        default="1.0,0.5,0.25",
+        help="Comma-separated scale factors for multi-scale edge extraction (e.g., '1.0,0.5,0.25').",
+    )
+    parser.add_argument(
+        "--log_scale_weights_every",
+        type=int,
+        default=100,
+        help="Log multi-scale conditioning weights every N steps for monitoring (0 disables).",
+    )
 
     if input_args is not None:
         args = parser.parse_args(input_args)
@@ -717,6 +752,48 @@ if args.controlnet_model_name_or_path:
 else:
     logger.info("Initializing controlnet weights from unet")
     controlnet = ControlNetModel.from_unet(unet, use_image_cross_attention=True)
+
+# Initialize Multi-Scale Conditioning Injector (if enabled)
+multi_scale_injector = None
+if args.use_multi_scale_conditioning:
+    logger.info("=" * 50)
+    logger.info("Enabling Multi-Scale Conditional Injection")
+    logger.info(f"  - Learnable scales: {args.multi_scale_learnable}")
+    logger.info(f"  - Progressive scaling: {args.multi_scale_progressive}")
+    logger.info(f"  - Initial scale value: {args.multi_scale_init_value}")
+    logger.info("=" * 50)
+    
+    # Get number of down blocks from controlnet config
+    # Note: This might not match the actual number of outputs (which could be 3x due to residuals)
+    num_down_blocks = len(controlnet.config.down_block_types)
+    
+    # Try to load the actual layer count from a previous run
+    layer_count_file = os.path.join(args.output_dir, ".multi_scale_layer_count")
+    if os.path.exists(layer_count_file):
+        try:
+            with open(layer_count_file, 'r') as f:
+                saved_count = int(f.read().strip())
+            logger.info(f"  - Using saved layer count from previous run: {saved_count}")
+            # Use saved count for initialization
+            num_down_blocks = saved_count - 1  # Subtract mid block
+        except:
+            pass
+    
+    logger.info(f"  - Initializing with {num_down_blocks} down blocks")
+    logger.info(f"  - Total layers (down blocks + mid block): {num_down_blocks + 1}")
+    logger.info(f"  - Note: Actual layer count will be auto-detected on first forward pass")
+    
+    multi_scale_injector = create_multi_scale_injector(
+        num_down_blocks=num_down_blocks,
+        learnable_scales=args.multi_scale_learnable,
+        progressive_scale=args.multi_scale_progressive,
+        init_scale=args.multi_scale_init_value,
+    )
+    
+    # If learnable, we need to optimize its parameters
+    if args.multi_scale_learnable:
+        logger.info(f"Multi-scale injector has {sum(p.numel() for p in multi_scale_injector.parameters())} trainable parameters")
+        logger.info(f"Initial weights: {multi_scale_injector.scale_weights.get_all_weights().tolist()}")
     
 
 # `accelerate` 0.16.0 will have better support for customized saving
@@ -733,9 +810,24 @@ if version.parse(accelerate.__version__) >= version.parse("0.16.0"):
         #     model.save_pretrained(os.path.join(output_dir, sub_dir))
 
         #     i -= 1
-        assert len(models) == 2 and len(weights) == 2
+        
+        # Support 2 models (controlnet, unet) or 3 models (controlnet, unet, multi_scale_injector)
+        assert len(models) in [2, 3] and len(weights) in [2, 3], f"Expected 2 or 3 models, got {len(models)} models and {len(weights)} weights"
+        
         for i, model in enumerate(models):
-            sub_dir = "unet" if isinstance(model, UNet2DConditionModel) else "controlnet"
+            if isinstance(model, UNet2DConditionModel):
+                sub_dir = "unet"
+            elif hasattr(model, '__class__') and model.__class__.__name__ == 'MultiScaleConditionInjector':
+                sub_dir = "multi_scale_injector"
+                # Save as torch state dict for multi_scale_injector
+                save_dir = os.path.join(output_dir, sub_dir)
+                os.makedirs(save_dir, exist_ok=True)
+                torch.save(model.state_dict(), os.path.join(save_dir, "pytorch_model.bin"))
+                weights.pop()
+                continue
+            else:
+                sub_dir = "controlnet"
+            
             model.save_pretrained(os.path.join(output_dir, sub_dir))
             # make sure to pop weight so that corresponding model is not saved again
             weights.pop()
@@ -751,16 +843,25 @@ if version.parse(accelerate.__version__) >= version.parse("0.16.0"):
 
         #     model.load_state_dict(load_model.state_dict())
         #     del load_model
-        assert len(models) == 2
+        
+        # Support 2 models (controlnet, unet) or 3 models (controlnet, unet, multi_scale_injector)
+        assert len(models) in [2, 3], f"Expected 2 or 3 models, got {len(models)} models"
+        
         for i in range(len(models)):
             # pop models so that they are not loaded again
             model = models.pop()
 
             # load diffusers style into model
-            if not isinstance(model, UNet2DConditionModel):
-                load_model = ControlNetModel.from_pretrained(input_dir, subfolder="controlnet") # , low_cpu_mem_usage=False, ignore_mismatched_sizes=True
-            else:
+            if isinstance(model, UNet2DConditionModel):
                 load_model = UNet2DConditionModel.from_pretrained(input_dir, subfolder="unet") # , low_cpu_mem_usage=False, ignore_mismatched_sizes=True
+            elif hasattr(model, '__class__') and model.__class__.__name__ == 'MultiScaleConditionInjector':
+                # Load multi_scale_injector from saved state dict
+                state_dict_path = os.path.join(input_dir, "multi_scale_injector", "pytorch_model.bin")
+                if os.path.exists(state_dict_path):
+                    model.load_state_dict(torch.load(state_dict_path))
+                continue
+            else:
+                load_model = ControlNetModel.from_pretrained(input_dir, subfolder="controlnet") # , low_cpu_mem_usage=False, ignore_mismatched_sizes=True
 
             model.register_to_config(**load_model.config)
 
@@ -859,6 +960,10 @@ else:
 print(f'=================Optimize ControlNet and Unet ======================')
 params_to_optimize = list(controlnet.parameters()) + list(unet.parameters())
 
+# Add multi-scale injector parameters if learnable
+if args.use_multi_scale_conditioning and args.multi_scale_learnable:
+    params_to_optimize += list(multi_scale_injector.parameters())
+    print(f'Also optimizing Multi-Scale Injector parameters')
 
 print(f'start to load optimizer...')
 
@@ -902,9 +1007,18 @@ lr_scheduler = get_scheduler(
 )
 
 # Prepare everything with our `accelerator`.
-controlnet, unet, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
-    controlnet, unet, optimizer, train_dataloader, lr_scheduler
-)
+if args.use_multi_scale_conditioning and args.multi_scale_learnable:
+    # Include multi_scale_injector in preparation
+    controlnet, unet, multi_scale_injector, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
+        controlnet, unet, multi_scale_injector, optimizer, train_dataloader, lr_scheduler
+    )
+else:
+    controlnet, unet, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
+        controlnet, unet, optimizer, train_dataloader, lr_scheduler
+    )
+    # Move injector to device if it exists but not learnable
+    if multi_scale_injector is not None:
+        multi_scale_injector = multi_scale_injector.to(accelerator.device)
 
 # For mixed precision training we cast the text_encoder and vae weights to half-precision
 # as these models are only used for inference, keeping weights in full precision is not required.
@@ -1078,6 +1192,43 @@ for epoch in range(first_epoch, args.num_train_epochs):
                 return_dict=False,
                 image_encoder_hidden_states=ram_encoder_hidden_states,
             )
+            
+            # Apply multi-scale conditioning (if enabled)
+            if args.use_multi_scale_conditioning:
+                # Unwrap from DDP if necessary
+                injector = accelerator.unwrap_model(multi_scale_injector) if args.multi_scale_learnable else multi_scale_injector
+                
+                # Debug: log the number of outputs on first step
+                if global_step == 0 and accelerator.is_main_process:
+                    logger.info(f"ControlNet outputs: {len(down_block_res_samples)} down blocks, "
+                               f"mid block: {'Yes' if mid_block_res_sample is not None else 'No'}")
+                    
+                    # Check if weights need resizing
+                    expected_size = len(down_block_res_samples) + (1 if mid_block_res_sample is not None else 0)
+                    current_size = len(injector.scale_weights.get_all_weights())
+                    
+                    # Save the actual layer count for future runs
+                    layer_count_file = os.path.join(args.output_dir, ".multi_scale_layer_count")
+                    try:
+                        with open(layer_count_file, 'w') as f:
+                            f.write(str(expected_size))
+                        logger.info(f"✓ Saved layer count ({expected_size}) to {layer_count_file}")
+                    except:
+                        pass
+                    
+                    if current_size != expected_size:
+                        logger.warning(f"⚠️  Weight size mismatch detected!")
+                        logger.warning(f"   Expected: {expected_size}, Got: {current_size}")
+                        logger.warning(f"   Weights will be auto-resized on first forward pass.")
+                        logger.warning(f"   ⚠️  IMPORTANT: Please STOP (Ctrl+C) and restart for optimal results!")
+                        logger.warning(f"   The restart will use the correct size from the beginning.")
+                    else:
+                        logger.info(f"✓ Weight size matches perfectly: {expected_size} layers")
+                
+                down_block_res_samples, mid_block_res_sample = injector.apply_conditioning(
+                    down_block_res_samples,
+                    mid_block_res_sample
+                )
 
             # Predict the noise residual
             model_pred = unet(
@@ -1136,6 +1287,26 @@ for epoch in range(first_epoch, args.num_train_epochs):
                     )
 
         logs = {"loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
+        
+        # Log multi-scale conditioning weights (if enabled and periodic)
+        if (args.use_multi_scale_conditioning and 
+            args.log_scale_weights_every > 0 and 
+            accelerator.sync_gradients and
+            (global_step + 1) % args.log_scale_weights_every == 0):
+            
+            # Unwrap from DDP if necessary
+            injector = accelerator.unwrap_model(multi_scale_injector) if args.multi_scale_learnable else multi_scale_injector
+            scale_info = injector.get_scale_info()
+            logs.update({
+                "scale_weights/mean": scale_info['mean'],
+                "scale_weights/std": scale_info['std'],
+                "scale_weights/min": scale_info['min'],
+                "scale_weights/max": scale_info['max'],
+            })
+            # Log individual weights
+            for i, w in enumerate(scale_info['weights']):
+                logs[f"scale_weights/layer_{i}"] = w
+        
         progress_bar.set_postfix(**logs)
         accelerator.log(logs, step=global_step)
 

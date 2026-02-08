@@ -46,6 +46,7 @@ from diffusers.utils.import_utils import is_xformers_available
 from dataloaders.paired_dataset import PairedCaptionDataset
 from utils.spatial_noise import compute_edge_strength, compute_multi_scale_edges
 from models.multi_scale_conditioning import create_multi_scale_injector
+from losses.consistency_losses import create_consistency_loss_manager
 
 from typing import Mapping, Any
 from torchvision import transforms
@@ -620,6 +621,73 @@ def parse_args(input_args=None):
         default=100,
         help="Log multi-scale conditioning weights every N steps for monitoring (0 disables).",
     )
+    
+    # Consistency Loss (Multi-Task Learning Innovation)
+    parser.add_argument(
+        "--use_consistency_loss",
+        action="store_true",
+        help="Enable multi-task consistency losses (edge + frequency + perceptual).",
+    )
+    parser.add_argument(
+        "--consistency_use_edge",
+        action="store_true",
+        help="Use edge consistency loss.",
+    )
+    parser.add_argument(
+        "--consistency_use_frequency",
+        action="store_true",
+        help="Use frequency consistency loss.",
+    )
+    parser.add_argument(
+        "--consistency_use_perceptual",
+        action="store_true",
+        help="Use perceptual consistency loss (requires VGG, slower).",
+    )
+    parser.add_argument(
+        "--consistency_edge_weight",
+        type=float,
+        default=0.1,
+        help="Weight for edge consistency loss.",
+    )
+    parser.add_argument(
+        "--consistency_frequency_weight",
+        type=float,
+        default=0.1,
+        help="Weight for frequency consistency loss.",
+    )
+    parser.add_argument(
+        "--consistency_perceptual_weight",
+        type=float,
+        default=0.01,
+        help="Weight for perceptual consistency loss.",
+    )
+    parser.add_argument(
+        "--consistency_edge_loss_type",
+        type=str,
+        default="l1",
+        choices=["l1", "l2"],
+        help="Loss type for edge consistency (l1 or l2).",
+    )
+    parser.add_argument(
+        "--consistency_freq_loss_type",
+        type=str,
+        default="l1",
+        choices=["l1", "l2"],
+        help="Loss type for frequency consistency (l1 or l2).",
+    )
+    parser.add_argument(
+        "--consistency_perceptual_loss_type",
+        type=str,
+        default="l1",
+        choices=["l1", "l2"],
+        help="Loss type for perceptual consistency (l1 or l2).",
+    )
+    parser.add_argument(
+        "--consistency_high_freq_weight",
+        type=float,
+        default=2.0,
+        help="Weight multiplier for high-frequency components in frequency loss.",
+    )
 
     if input_args is not None:
         args = parser.parse_args(input_args)
@@ -795,6 +863,20 @@ if args.use_multi_scale_conditioning:
         logger.info(f"Multi-scale injector has {sum(p.numel() for p in multi_scale_injector.parameters())} trainable parameters")
         logger.info(f"Initial weights: {multi_scale_injector.scale_weights.get_all_weights().tolist()}")
     
+
+# Initialize consistency loss manager (Multi-Task Learning Innovation)
+consistency_loss_manager = None
+if args.use_consistency_loss:
+    logger.info("Initializing Consistency Loss Manager...")
+    consistency_loss_manager = create_consistency_loss_manager(args)
+    consistency_loss_manager.to(accelerator.device)
+    
+    logger.info(f"  - Edge Loss: {args.consistency_use_edge} (weight={args.consistency_edge_weight})")
+    logger.info(f"  - Frequency Loss: {args.consistency_use_frequency} (weight={args.consistency_frequency_weight})")
+    logger.info(f"  - Perceptual Loss: {args.consistency_use_perceptual} (weight={args.consistency_perceptual_weight})")
+    
+    # Consistency loss does not have trainable parameters (uses fixed VGG)
+    # So no need to add to optimizer
 
 # `accelerate` 0.16.0 will have better support for customized saving
 if version.parse(accelerate.__version__) >= version.parse("0.16.0"):
@@ -1249,7 +1331,51 @@ for epoch in range(first_epoch, args.num_train_epochs):
                 target = noise_scheduler.get_velocity(latents, noise_for_latents, timesteps)
             else:
                 raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
-            loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
+            
+            # Diffusion loss (main objective)
+            loss_diffusion = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
+            loss = loss_diffusion
+            
+            # Add consistency losses (if enabled)
+            # Note: Consistency losses operate in pixel space, so we need to decode latents
+            if consistency_loss_manager is not None:
+                # Predict x0 from noisy latents and model prediction
+                # Fix: ensure alphas_cumprod is on the same device as timesteps
+                alphas_cumprod = noise_scheduler.alphas_cumprod.to(device=latents.device, dtype=latents.dtype)
+                alpha_t = alphas_cumprod[timesteps].view(-1, 1, 1, 1)
+                sqrt_alpha_t = torch.sqrt(alpha_t)
+                sqrt_one_minus_alpha_t = torch.sqrt(1 - alpha_t)
+
+                if noise_scheduler.config.prediction_type == "epsilon":
+                    # x0 = (x_t - sqrt(1-alpha_t) * eps) / sqrt(alpha_t)
+                    pred_original_sample = (noisy_latents - sqrt_one_minus_alpha_t * model_pred) / sqrt_alpha_t
+                elif noise_scheduler.config.prediction_type == "v_prediction":
+                    # x0 = sqrt(alpha_t) * x_t - sqrt(1-alpha_t) * v
+                    pred_original_sample = sqrt_alpha_t * noisy_latents - sqrt_one_minus_alpha_t * model_pred
+                else:
+                    pred_original_sample = latents
+
+                # Clamp to valid range
+                pred_original_sample = pred_original_sample.clamp(-1, 1)
+
+                # Decode to pixel space (keep gradients for consistency loss)
+                # Important: convert to weight_dtype (fp16) to match VAE precision
+                pred_pixels = vae.decode(
+                    (pred_original_sample / vae.config.scaling_factor).to(dtype=weight_dtype)
+                ).sample
+                
+                # Convert to float32 for consistency loss computation
+                pred_pixels = pred_pixels.float()
+                target_pixels = pixel_values.float()
+
+                loss_consistency, consistency_details = consistency_loss_manager(
+                    pred_pixels,
+                    target_pixels,
+                    return_details=True
+                )
+                
+                # Add to total loss
+                loss = loss + loss_consistency
 
             accelerator.backward(loss)
             if accelerator.sync_gradients:
@@ -1287,6 +1413,14 @@ for epoch in range(first_epoch, args.num_train_epochs):
                     )
 
         logs = {"loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
+        
+        # Log loss components
+        if consistency_loss_manager is not None:
+            logs["loss_diffusion"] = loss_diffusion.detach().item()
+            logs["loss_consistency"] = loss_consistency.detach().item()
+            # Log detailed consistency losses
+            for key, value in consistency_details.items():
+                logs[f"consistency/{key}"] = value
         
         # Log multi-scale conditioning weights (if enabled and periodic)
         if (args.use_multi_scale_conditioning and 

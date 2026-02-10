@@ -1,0 +1,1 @@
+CUDA_VISIBLE_DEVICES=2 python evalution_total.py

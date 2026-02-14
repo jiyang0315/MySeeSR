@@ -13,7 +13,7 @@ Multi-Scale Conditional Injection for ControlNet-based Super-Resolution
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import List, Dict, Optional, Tuple
+from typing import List, Dict, Optional, Tuple, Any
 
 
 class LearnableScaleWeights(nn.Module):
@@ -70,6 +70,53 @@ class LearnableScaleWeights(nn.Module):
         return f'num_layers={self.num_layers}, learnable={self.learnable}'
 
 
+class DynamicScalePredictor(nn.Module):
+    """
+    动态尺度预测器。
+    根据输入条件特征预测每个层级的条件强度（每个样本独立）。
+    """
+
+    def __init__(
+        self,
+        in_channels: int,
+        num_layers: int,
+        hidden_dim: int = 128,
+        min_scale: float = 0.5,
+        max_scale: float = 1.5,
+    ):
+        super().__init__()
+        self.in_channels = in_channels
+        self.num_layers = num_layers
+        self.hidden_dim = hidden_dim
+        self.min_scale = min_scale
+        self.max_scale = max_scale
+
+        self.pool = nn.AdaptiveAvgPool2d(1)
+        self.mlp = self._build_mlp(self.num_layers)
+
+    def _build_mlp(self, out_dim: int) -> nn.Sequential:
+        return nn.Sequential(
+            nn.Linear(self.in_channels, self.hidden_dim),
+            nn.SiLU(),
+            nn.Linear(self.hidden_dim, out_dim),
+        )
+
+    def resize_num_layers(self, new_num_layers: int):
+        if new_num_layers == self.num_layers:
+            return
+        self.num_layers = new_num_layers
+        self.mlp = self._build_mlp(self.num_layers).to(next(self.parameters()).device)
+
+    def forward(self, cond_features: torch.Tensor) -> torch.Tensor:
+        # cond_features: (B, C, H, W)
+        x = self.pool(cond_features).flatten(1)
+        x = x.to(dtype=next(self.mlp.parameters()).dtype)
+        logits = self.mlp(x)
+        weights = torch.sigmoid(logits)
+        weights = self.min_scale + (self.max_scale - self.min_scale) * weights
+        return weights
+
+
 class MultiScaleConditionInjector(nn.Module):
     """
     多尺度条件注入器。
@@ -87,6 +134,11 @@ class MultiScaleConditionInjector(nn.Module):
         learnable_scales: bool = True,
         init_scale: float = 1.0,
         progressive_scale: bool = True,
+        use_dynamic_scales: bool = False,
+        dynamic_in_channels: int = 3,
+        dynamic_hidden_dim: int = 128,
+        dynamic_min_scale: float = 0.5,
+        dynamic_max_scale: float = 1.5,
     ):
         """
         Args:
@@ -102,7 +154,13 @@ class MultiScaleConditionInjector(nn.Module):
         self.progressive_scale = progressive_scale
         self.learnable_scales = learnable_scales
         self.init_scale = init_scale
+        self.use_dynamic_scales = use_dynamic_scales
+        self.dynamic_in_channels = dynamic_in_channels
+        self.dynamic_hidden_dim = dynamic_hidden_dim
+        self.dynamic_min_scale = dynamic_min_scale
+        self.dynamic_max_scale = dynamic_max_scale
         self._initialized = False
+        self._last_dynamic_weights_mean = None
         
         # 计算总层数（初始估计）
         total_layers = num_down_blocks + (1 if has_mid_block else 0)
@@ -126,6 +184,16 @@ class MultiScaleConditionInjector(nn.Module):
             )
         
         self.total_layers = total_layers
+        if self.use_dynamic_scales:
+            self.dynamic_predictor = DynamicScalePredictor(
+                in_channels=self.dynamic_in_channels,
+                num_layers=total_layers,
+                hidden_dim=self.dynamic_hidden_dim,
+                min_scale=self.dynamic_min_scale,
+                max_scale=self.dynamic_max_scale,
+            )
+        else:
+            self.dynamic_predictor = None
     
     def _resize_weights(self, new_size: int):
         """
@@ -171,11 +239,14 @@ class MultiScaleConditionInjector(nn.Module):
         self.scale_weights.weights.data.copy_(new_weights.to(self.scale_weights.weights.device))
         self.total_layers = new_size
         self._initialized = True
+        if self.use_dynamic_scales and self.dynamic_predictor is not None:
+            self.dynamic_predictor.resize_num_layers(new_size)
     
     def apply_conditioning(
         self,
         controlnet_outputs: List[torch.Tensor],
         mid_block_output: Optional[torch.Tensor] = None,
+        cond_features: Optional[torch.Tensor] = None,
     ) -> Tuple[List[torch.Tensor], Optional[torch.Tensor]]:
         """
         对ControlNet的输出应用可学习的尺度权重。
@@ -215,6 +286,34 @@ class MultiScaleConditionInjector(nn.Module):
                 warnings.warn(msg)
                 self._resize_weights(expected_weights)
         
+        if self.use_dynamic_scales:
+            if cond_features is None:
+                raise ValueError("`cond_features` is required when `use_dynamic_scales=True`.")
+            if cond_features.dim() != 4:
+                raise ValueError(
+                    f"`cond_features` must be 4D tensor [B, C, H, W], got shape: {tuple(cond_features.shape)}"
+                )
+
+            dynamic_weights = self.dynamic_predictor(cond_features)
+            if dynamic_weights.shape[1] != expected_weights:
+                self._resize_weights(expected_weights)
+                dynamic_weights = self.dynamic_predictor(cond_features)
+
+            self._last_dynamic_weights_mean = dynamic_weights.detach().mean(dim=0)
+            scaled_outputs = []
+            for i, output in enumerate(controlnet_outputs):
+                w = dynamic_weights[:, i].view(-1, 1, 1, 1).to(dtype=output.dtype, device=output.device)
+                scaled_outputs.append(output * w)
+
+            scaled_mid = None
+            if mid_block_output is not None and self.has_mid_block:
+                mid_weight = dynamic_weights[:, num_outputs].view(-1, 1, 1, 1).to(
+                    dtype=mid_block_output.dtype, device=mid_block_output.device
+                )
+                scaled_mid = mid_block_output * mid_weight
+
+            return scaled_outputs, scaled_mid
+
         weights = self.scale_weights.get_all_weights()
         
         # 再次检查（理论上不会触发，但保险起见）
@@ -248,13 +347,17 @@ class MultiScaleConditionInjector(nn.Module):
         Returns:
             info: 包含尺度权重统计的字典
         """
-        weights = self.scale_weights.get_all_weights().detach().cpu()
+        if self.use_dynamic_scales and self._last_dynamic_weights_mean is not None:
+            weights = self._last_dynamic_weights_mean.detach().cpu()
+        else:
+            weights = self.scale_weights.get_all_weights().detach().cpu()
         return {
             'weights': weights.tolist(),
             'mean': weights.mean().item(),
             'std': weights.std().item(),
             'min': weights.min().item(),
             'max': weights.max().item(),
+            'is_dynamic': self.use_dynamic_scales,
         }
     
     def extra_repr(self) -> str:
@@ -342,6 +445,11 @@ def create_multi_scale_injector(
     learnable_scales: bool = True,
     progressive_scale: bool = True,
     init_scale: float = 1.0,
+    use_dynamic_scales: bool = False,
+    dynamic_in_channels: int = 3,
+    dynamic_hidden_dim: int = 128,
+    dynamic_min_scale: float = 0.5,
+    dynamic_max_scale: float = 1.5,
 ) -> MultiScaleConditionInjector:
     """
     工厂函数：创建多尺度条件注入器。
@@ -367,5 +475,10 @@ def create_multi_scale_injector(
         learnable_scales=learnable_scales,
         init_scale=init_scale,
         progressive_scale=progressive_scale,
+        use_dynamic_scales=use_dynamic_scales,
+        dynamic_in_channels=dynamic_in_channels,
+        dynamic_hidden_dim=dynamic_hidden_dim,
+        dynamic_min_scale=dynamic_min_scale,
+        dynamic_max_scale=dynamic_max_scale,
     )
 

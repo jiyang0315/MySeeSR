@@ -18,82 +18,139 @@ METRIC_FUNCS = {
     "musiq": pyiqa.create_metric('musiq')
 }
 
-# 预定义数据集大小
-DATASET_SIZE_MAP = {
-    "realworld_testdata": 100,
-    "chaoji_new": 21
-}
-
-# 配置路径
-UPSCALE_FOLDER = "/home/jiyang/jiyang/Projects/image_superresolution/datasets/testdata_output_7"
-TRUE_FOLDER = "/home/jiyang/jiyang/Projects/image_superresolution/evalution/true_folfer"
-OUTPUT_FILE = "/home/jiyang/jiyang/Projects/image_superresolution/evalution/20251114_invsr_lora_5_6_ck.json"
+# 配置路径 - SeeSR测试
+UPSCALE_FOLDER = "/home/jiyang/jiyang/Projects/SeeSR/evalution/test_output"
+TRUE_FOLDER = "/home/jiyang/jiyang/Projects/SeeSR/preset/datasets/test_datasets/DIV2K/HR"
+OUTPUT_FILE = "/home/jiyang/jiyang/Projects/SeeSR/evalution/evaluation_results.json"
 
 def evaluate_models(upscale_folder, true_folder):
-    """计算超分辨率模型的 PSNR、SSIM、LPIPS、NIQE、NRQM、PI、BRISQUE 指标，并计算均值"""
-    json_data = defaultdict(lambda: defaultdict(lambda: defaultdict(float)))
+    """
+    计算超分辨率模型的多种指标
+    
+    目录结构:
+    upscale_folder/
+        model_name_1/
+            sample00/
+                0801.png
+                0802.png
+                ...
+        model_name_2/
+            sample00/
+                ...
+    
+    true_folder/
+        0801.png
+        0802.png
+        ...
+    """
+    json_data = defaultdict(lambda: defaultdict(float))
+    model_image_counts = defaultdict(int)
 
-    # 遍历数据集
-    for dataset_name in tqdm(os.listdir(upscale_folder), desc="Processing Datasets"):
-        dataset_path = os.path.join(upscale_folder, dataset_name)  
-
-        if not os.path.isdir(dataset_path):
-            continue  # 确保是目录
-
-        for model_name in tqdm(os.listdir(dataset_path), desc=f"Processing Models ({dataset_name})"):
-            model_path = os.path.join(dataset_path, model_name)
+    # 遍历模型文件夹
+    model_folders = sorted([d for d in os.listdir(upscale_folder) 
+                           if os.path.isdir(os.path.join(upscale_folder, d))])
+    
+    print(f"找到 {len(model_folders)} 个模型待评估: {model_folders}")
+    
+    for model_name in tqdm(model_folders, desc="评估模型"):
+        model_path = os.path.join(upscale_folder, model_name)
+        
+        # 检查是否有sample00子文件夹
+        sample_folder = os.path.join(model_path, "sample00")
+        if os.path.isdir(sample_folder):
+            image_folder = sample_folder
+        else:
+            # 如果没有sample00，直接使用模型文件夹
+            image_folder = model_path
+        
+        # 获取该模型的所有图片
+        image_files = sorted([f for f in os.listdir(image_folder) 
+                            if f.endswith(('.png', '.jpg', '.jpeg'))])
+        
+        if not image_files:
+            print(f"警告: {model_name} 中没有找到图片")
+            continue
+        
+        print(f"\n处理 {model_name}: {len(image_files)} 张图片")
+        
+        # 遍历所有图片
+        for image_name in tqdm(image_files, desc=f"  {model_name}", leave=False):
+            image_path = os.path.join(image_folder, image_name)
+            true_path = os.path.join(true_folder, image_name)
             
-            if not os.path.isdir(model_path):
-                continue  # 确保是目录
-
-            for image_name in os.listdir(model_path):
-                image_path = os.path.join(model_path, image_name)
-                
-                true_path = os.path.join(true_folder,dataset_name, image_name)
-                
-                for metric_name, metric_func in METRIC_FUNCS.items():
-                    try:
-                        score = None
+            # 检查GT是否存在
+            if not os.path.exists(true_path):
+                print(f"警告: GT不存在: {true_path}")
+                continue
+            
+            model_image_counts[model_name] += 1
+            
+            # 计算所有指标
+            for metric_name, metric_func in METRIC_FUNCS.items():
+                try:
+                    score = None
+                    
+                    if metric_name in ["psnr", "ssim", "lpips"]:
+                        # 需要GT的指标
+                        score = metric_func(image_path, true_path)
+                    else:
+                        # 无参考指标
+                        score = metric_func(image_path).item()
+                    
+                    if score is not None:
+                        json_data[model_name][metric_name] += score
                         
-                        # 如果是 chaoji_new，不计算 lpips 和 musiq
-                        if dataset_name == "chaoji_new" and metric_name in ["psnr", "ssim", "lpips"]:
-                            continue
-                        if dataset_name == "chaoji_new" and metric_name == "musiq":
-                            continue
-                        
-                        if metric_name in ["psnr", "ssim", "lpips"]:
-                            if dataset_name != "chaoji_new":
-                                score = metric_func(image_path, true_path)
-                        else:
-                            score = metric_func(image_path).item()
-                        
-                        if score is not None:
-                            json_data[dataset_name][metric_name][model_name] += score
-                    except Exception as e:
-                        print(f"Error processing {image_path} ({metric_name}): {e}")
+                except Exception as e:
+                    print(f"错误: 处理 {image_path} 的 {metric_name} 时出错: {e}")
 
     # 计算均值
-    return calculate_average(json_data)
+    return calculate_average(json_data, model_image_counts)
 
-def calculate_average(data):
-    """计算数据集的均值"""
-    for dataset_name, dataset_metrics in data.items():
-        dataset_size = DATASET_SIZE_MAP.get(dataset_name)  # 获取数据集大小
-
-        for metric_name, model_scores in dataset_metrics.items():
-            for model_name in model_scores:
-                data[dataset_name][metric_name][model_name] = round(
-                    model_scores[model_name] / dataset_size, 3
-                )
-    return data
+def calculate_average(data, model_image_counts):
+    """计算每个模型的指标均值"""
+    result = {}
+    
+    for model_name, metrics in data.items():
+        image_count = model_image_counts[model_name]
+        
+        if image_count == 0:
+            print(f"警告: {model_name} 没有有效图片")
+            continue
+        
+        result[model_name] = {}
+        for metric_name, total_score in metrics.items():
+            avg_score = total_score / image_count
+            result[model_name][metric_name] = round(avg_score, 4)
+        
+        result[model_name]["image_count"] = image_count
+    
+    return result
 
 
 def save_results(data, output_file):
     """保存计算结果为 JSON 文件"""
     os.makedirs(os.path.dirname(output_file), exist_ok=True)  # 确保输出目录存在
+    
     with open(output_file, "w", encoding="utf-8") as json_file:
-        json.dump({k: dict(v) for k, v in data.items()}, json_file, indent=4, ensure_ascii=False)
-    print(f"数据已保存到 JSON 文件: {output_file}")
+        json.dump(data, json_file, indent=4, ensure_ascii=False)
+    
+    print(f"\n{'='*60}")
+    print(f"评估结果已保存: {output_file}")
+    print(f"{'='*60}")
+    
+    # 打印摘要
+    print("\n评估摘要:")
+    print(f"{'模型名称':<40} {'PSNR↑':>8} {'SSIM↑':>8} {'LPIPS↓':>8} {'NIQE↓':>8}")
+    print("-" * 80)
+    
+    for model_name, metrics in sorted(data.items()):
+        psnr = metrics.get('psnr', 0)
+        ssim = metrics.get('ssim', 0)
+        lpips = metrics.get('lpips', 0)
+        niqe = metrics.get('niqe', 0)
+        print(f"{model_name:<40} {psnr:>8.4f} {ssim:>8.4f} {lpips:>8.4f} {niqe:>8.4f}")
+    
+    print("-" * 80)
 
 
 def main():

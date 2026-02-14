@@ -47,6 +47,7 @@ from dataloaders.paired_dataset import PairedCaptionDataset
 from utils.spatial_noise import compute_edge_strength, compute_multi_scale_edges
 from models.multi_scale_conditioning import create_multi_scale_injector
 from losses.consistency_losses import create_consistency_loss_manager
+from models.timestep_adaptive import create_timestep_adaptive_weights, create_joint_scaler
 
 from typing import Mapping, Any
 from torchvision import transforms
@@ -688,6 +689,50 @@ def parse_args(input_args=None):
         default=2.0,
         help="Weight multiplier for high-frequency components in frequency loss.",
     )
+    
+    # Timestep-Adaptive Conditioning (Innovation)
+    parser.add_argument(
+        "--use_timestep_adaptive",
+        action="store_true",
+        help="Enable timestep-adaptive conditioning that adjusts condition strength based on denoising timestep.",
+    )
+    parser.add_argument(
+        "--timestep_strategy",
+        type=str,
+        default="cosine",
+        choices=["linear", "cosine", "exponential", "learned"],
+        help="Strategy for timestep-adaptive weight scheduling.",
+    )
+    parser.add_argument(
+        "--timestep_max_weight",
+        type=float,
+        default=1.3,
+        help="Maximum conditioning weight at early timesteps (high noise).",
+    )
+    parser.add_argument(
+        "--timestep_min_weight",
+        type=float,
+        default=0.7,
+        help="Minimum conditioning weight at late timesteps (low noise).",
+    )
+    parser.add_argument(
+        "--timestep_learnable",
+        action="store_true",
+        help="Use learnable MLP for timestep-weight mapping instead of fixed schedules.",
+    )
+    parser.add_argument(
+        "--timestep_combination",
+        type=str,
+        default="multiply",
+        choices=["multiply", "add", "learned"],
+        help="How to combine layer weights and timestep weights (multiply/add/learned).",
+    )
+    parser.add_argument(
+        "--log_timestep_weights_every",
+        type=int,
+        default=500,
+        help="Log timestep weight samples every N steps for monitoring (0 disables).",
+    )
 
     if input_args is not None:
         args = parser.parse_args(input_args)
@@ -878,6 +923,59 @@ if args.use_consistency_loss:
     # Consistency loss does not have trainable parameters (uses fixed VGG)
     # So no need to add to optimizer
 
+# Initialize timestep-adaptive conditioning (Timestep-Adaptive Innovation)
+timestep_adaptive_weights = None
+joint_condition_scaler = None
+if args.use_timestep_adaptive:
+    logger.info("Initializing Timestep-Adaptive Conditioning...")
+    
+    # Get number of train timesteps from noise scheduler
+    num_train_timesteps = noise_scheduler.config.num_train_timesteps
+    
+    timestep_adaptive_weights = create_timestep_adaptive_weights(
+        num_train_timesteps=num_train_timesteps,
+        strategy=args.timestep_strategy,
+        max_weight=args.timestep_max_weight,
+        min_weight=args.timestep_min_weight,
+        learnable=args.timestep_learnable,
+    )
+    
+    logger.info(f"  - Strategy: {args.timestep_strategy}")
+    logger.info(f"  - Weight range: [{args.timestep_min_weight}, {args.timestep_max_weight}]")
+    logger.info(f"  - Learnable: {args.timestep_learnable}")
+    logger.info(f"  - Combination with layer weights: {args.timestep_combination}")
+    
+    # Create joint scaler to combine with multi-scale layer weights
+    if args.use_multi_scale_conditioning:
+        joint_condition_scaler = create_joint_scaler(
+            num_layers=num_down_blocks + 1,
+            layer_weights=multi_scale_injector.scale_weights if args.use_multi_scale_conditioning else None,
+            timestep_weights=timestep_adaptive_weights,
+            combination=args.timestep_combination,
+        )
+        logger.info(f"  - Joint scaler created (combines layer weights + timestep weights)")
+    else:
+        # If no multi-scale, timestep weights are applied directly
+        logger.info(f"  - Using timestep weights only (no layer weights)")
+    
+    # Move to device
+    timestep_adaptive_weights.to(accelerator.device)
+    if joint_condition_scaler is not None:
+        joint_condition_scaler.to(accelerator.device)
+    
+    # If learnable, add to optimizer
+    if args.timestep_learnable:
+        num_params = sum(p.numel() for p in timestep_adaptive_weights.parameters())
+        logger.info(f"  - Timestep adaptive module has {num_params} trainable parameters")
+    
+    # Log sample weights at different timesteps
+    sample_steps = [0, 250, 500, 750, 1000]
+    logger.info(f"  - Sample weights at different timesteps:")
+    for step in sample_steps:
+        if step <= num_train_timesteps:
+            weight = timestep_adaptive_weights.get_weight_at_step(step)
+            logger.info(f"    t={step:4d}: weight={weight:.4f}")
+
 # `accelerate` 0.16.0 will have better support for customized saving
 if version.parse(accelerate.__version__) >= version.parse("0.16.0"):
     # create custom saving & loading hooks so that `accelerator.save_state(...)` serializes in a nice format
@@ -1046,6 +1144,17 @@ params_to_optimize = list(controlnet.parameters()) + list(unet.parameters())
 if args.use_multi_scale_conditioning and args.multi_scale_learnable:
     params_to_optimize += list(multi_scale_injector.parameters())
     print(f'Also optimizing Multi-Scale Injector parameters')
+
+# Add timestep-adaptive parameters if learnable
+if args.use_timestep_adaptive and args.timestep_learnable:
+    params_to_optimize += list(timestep_adaptive_weights.parameters())
+    print(f'Also optimizing Timestep-Adaptive Conditioning parameters')
+
+# Add joint scaler parameters if learnable
+if args.use_timestep_adaptive and joint_condition_scaler is not None:
+    if args.timestep_combination == "learned":
+        params_to_optimize += list(joint_condition_scaler.parameters())
+        print(f'Also optimizing Joint Condition Scaler parameters')
 
 print(f'start to load optimizer...')
 
@@ -1275,42 +1384,98 @@ for epoch in range(first_epoch, args.num_train_epochs):
                 image_encoder_hidden_states=ram_encoder_hidden_states,
             )
             
-            # Apply multi-scale conditioning (if enabled)
-            if args.use_multi_scale_conditioning:
-                # Unwrap from DDP if necessary
-                injector = accelerator.unwrap_model(multi_scale_injector) if args.multi_scale_learnable else multi_scale_injector
+            # Apply adaptive conditioning (multi-scale and/or timestep-adaptive)
+            if args.use_multi_scale_conditioning or args.use_timestep_adaptive:
                 
-                # Debug: log the number of outputs on first step
-                if global_step == 0 and accelerator.is_main_process:
-                    logger.info(f"ControlNet outputs: {len(down_block_res_samples)} down blocks, "
-                               f"mid block: {'Yes' if mid_block_res_sample is not None else 'No'}")
+                # === Multi-Scale Conditioning (Layer-wise weights) ===
+                if args.use_multi_scale_conditioning:
+                    # Unwrap from DDP if necessary
+                    injector = accelerator.unwrap_model(multi_scale_injector) if args.multi_scale_learnable else multi_scale_injector
                     
-                    # Check if weights need resizing
-                    expected_size = len(down_block_res_samples) + (1 if mid_block_res_sample is not None else 0)
-                    current_size = len(injector.scale_weights.get_all_weights())
+                    # Debug: log the number of outputs on first step
+                    if global_step == 0 and accelerator.is_main_process:
+                        logger.info(f"ControlNet outputs: {len(down_block_res_samples)} down blocks, "
+                                   f"mid block: {'Yes' if mid_block_res_sample is not None else 'No'}")
+                        
+                        # Check if weights need resizing
+                        expected_size = len(down_block_res_samples) + (1 if mid_block_res_sample is not None else 0)
+                        current_size = len(injector.scale_weights.get_all_weights())
+                        
+                        # Save the actual layer count for future runs
+                        layer_count_file = os.path.join(args.output_dir, ".multi_scale_layer_count")
+                        try:
+                            with open(layer_count_file, 'w') as f:
+                                f.write(str(expected_size))
+                            logger.info(f"✓ Saved layer count ({expected_size}) to {layer_count_file}")
+                        except:
+                            pass
+                        
+                        if current_size != expected_size:
+                            logger.warning(f"⚠️  Weight size mismatch detected!")
+                            logger.warning(f"   Expected: {expected_size}, Got: {current_size}")
+                            logger.warning(f"   Weights will be auto-resized on first forward pass.")
+                            logger.warning(f"   ⚠️  IMPORTANT: Please STOP (Ctrl+C) and restart for optimal results!")
+                            logger.warning(f"   The restart will use the correct size from the beginning.")
+                        else:
+                            logger.info(f"✓ Weight size matches perfectly: {expected_size} layers")
+                
+                # === Timestep-Adaptive Conditioning ===
+                if args.use_timestep_adaptive:
+                    # Get timestep-adaptive weights
+                    timestep_w = timestep_adaptive_weights(timesteps)  # (B,)
+                    timestep_w_expanded = timestep_w.view(-1, 1, 1, 1)  # (B, 1, 1, 1)
                     
-                    # Save the actual layer count for future runs
-                    layer_count_file = os.path.join(args.output_dir, ".multi_scale_layer_count")
-                    try:
-                        with open(layer_count_file, 'w') as f:
-                            f.write(str(expected_size))
-                        logger.info(f"✓ Saved layer count ({expected_size}) to {layer_count_file}")
-                    except:
-                        pass
+                    # If both multi-scale and timestep-adaptive are enabled
+                    if args.use_multi_scale_conditioning:
+                        # First apply multi-scale conditioning
+                        down_block_res_samples, mid_block_res_sample = injector.apply_conditioning(
+                            down_block_res_samples,
+                            mid_block_res_sample
+                        )
+                        
+                        # Then apply timestep weights (multiply or add based on combination strategy)
+                        if args.timestep_combination == "multiply":
+                            # Multiply: final_weight = layer_weight × timestep_weight
+                            down_block_res_samples = tuple([
+                                down_sample * timestep_w_expanded for down_sample in down_block_res_samples
+                            ])
+                            if mid_block_res_sample is not None:
+                                mid_block_res_sample = mid_block_res_sample * timestep_w_expanded
+                        
+                        elif args.timestep_combination == "add":
+                            # Add: final_weight = layer_weight + (timestep_weight - 1)
+                            # This keeps the average around 1.0
+                            timestep_offset = timestep_w_expanded - 1.0
+                            down_block_res_samples = tuple([
+                                down_sample * (1.0 + timestep_offset) for down_sample in down_block_res_samples
+                            ])
+                            if mid_block_res_sample is not None:
+                                mid_block_res_sample = mid_block_res_sample * (1.0 + timestep_offset)
+                        
+                        elif args.timestep_combination == "learned":
+                            # For learned combination, we use multiplication for now
+                            # (More complex learned combination would require architectural changes)
+                            down_block_res_samples = tuple([
+                                down_sample * timestep_w_expanded for down_sample in down_block_res_samples
+                            ])
+                            if mid_block_res_sample is not None:
+                                mid_block_res_sample = mid_block_res_sample * timestep_w_expanded
                     
-                    if current_size != expected_size:
-                        logger.warning(f"⚠️  Weight size mismatch detected!")
-                        logger.warning(f"   Expected: {expected_size}, Got: {current_size}")
-                        logger.warning(f"   Weights will be auto-resized on first forward pass.")
-                        logger.warning(f"   ⚠️  IMPORTANT: Please STOP (Ctrl+C) and restart for optimal results!")
-                        logger.warning(f"   The restart will use the correct size from the beginning.")
                     else:
-                        logger.info(f"✓ Weight size matches perfectly: {expected_size} layers")
+                        # Only timestep-adaptive, no multi-scale
+                        # Apply timestep weight directly to all layers
+                        down_block_res_samples = tuple([
+                            down_sample * timestep_w_expanded for down_sample in down_block_res_samples
+                        ])
+                        if mid_block_res_sample is not None:
+                            mid_block_res_sample = mid_block_res_sample * timestep_w_expanded
                 
-                down_block_res_samples, mid_block_res_sample = injector.apply_conditioning(
-                    down_block_res_samples,
-                    mid_block_res_sample
-                )
+                elif args.use_multi_scale_conditioning:
+                    # Only multi-scale, no timestep-adaptive (original behavior)
+                    down_block_res_samples, mid_block_res_sample = injector.apply_conditioning(
+                        down_block_res_samples,
+                        mid_block_res_sample
+                    )
 
             # Predict the noise residual
             model_pred = unet(
@@ -1440,6 +1605,29 @@ for epoch in range(first_epoch, args.num_train_epochs):
             # Log individual weights
             for i, w in enumerate(scale_info['weights']):
                 logs[f"scale_weights/layer_{i}"] = w
+        
+        # Log timestep-adaptive weights (if enabled and periodic)
+        if (args.use_timestep_adaptive and 
+            args.log_timestep_weights_every > 0 and 
+            accelerator.sync_gradients and
+            (global_step + 1) % args.log_timestep_weights_every == 0):
+            
+            # Sample weights at different timesteps
+            sample_timesteps = [0, 250, 500, 750, 1000]
+            timestep_weights_module = accelerator.unwrap_model(timestep_adaptive_weights) if args.timestep_learnable else timestep_adaptive_weights
+            
+            for t in sample_timesteps:
+                if t <= noise_scheduler.config.num_train_timesteps:
+                    weight = timestep_weights_module.get_weight_at_step(t)
+                    logs[f"timestep_weights/t_{t}"] = weight
+            
+            # Log the current batch's timestep weights statistics
+            with torch.no_grad():
+                batch_timestep_weights = timestep_weights_module(timesteps)
+                logs["timestep_weights/batch_mean"] = batch_timestep_weights.mean().item()
+                logs["timestep_weights/batch_std"] = batch_timestep_weights.std().item()
+                logs["timestep_weights/batch_min"] = batch_timestep_weights.min().item()
+                logs["timestep_weights/batch_max"] = batch_timestep_weights.max().item()
         
         progress_bar.set_postfix(**logs)
         accelerator.log(logs, step=global_step)
